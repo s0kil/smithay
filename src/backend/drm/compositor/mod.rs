@@ -1112,8 +1112,7 @@ where
 
     swapchain: Swapchain<A>,
     normal_modifiers: Vec<DrmModifier>,
-    async_format_preference: Option<bool>,
-    preferred_formats_usable: bool,
+    async_format_preference: asynchronous::FormatPreference,
 
     cursor_size: Size<i32, Physical>,
     cursor_state: Option<CursorState<G>>,
@@ -1297,8 +1296,7 @@ where
                         queued_frame: None,
                         next_frame: None,
                         normal_modifiers: swapchain.modifiers().to_vec(),
-                        async_format_preference: None,
-                        preferred_formats_usable: true,
+                        async_format_preference: Default::default(),
                         swapchain,
                         framebuffer_exporter,
                         cursor_size,
@@ -1485,8 +1483,7 @@ where
             queued_frame: None,
             next_frame: None,
             normal_modifiers: swapchain.modifiers().to_vec(),
-            async_format_preference: None,
-            preferred_formats_usable: true,
+            async_format_preference: Default::default(),
             swapchain,
             framebuffer_exporter,
             cursor_size,
@@ -1739,6 +1736,8 @@ where
     /// and the primary plane. A replacement is allocated and KMS-tested before
     /// replacing the working swapchain; failure leaves existing buffers usable.
     /// Previously submitted buffers remain alive until their frame completes.
+    /// Allocation, KMS-test and renderer-import failures are retried after a
+    /// short cooldown, so a transient failure does not pin the old modifiers.
     ///
     /// Call before rendering when the compositor's presentation policy changes.
     /// `false` means that the preference could not be satisfied, not that normal
@@ -1751,15 +1750,17 @@ where
         <A::Buffer as AsDmabuf>::Error: 'static,
         F::Error: 'static,
     {
-        if self.async_format_preference == Some(enabled) {
-            return self.preferred_formats_usable;
+        if let Some(usable) = self
+            .async_format_preference
+            .cached(enabled, std::time::Instant::now)
+        {
+            return usable;
         }
         // A pending modeset cannot pass the no-modeset replacement test.
         // Defer without caching failure so resume/initial setup can complete.
         if self.surface.commit_pending() {
             return false;
         }
-        self.async_format_preference = Some(enabled);
         let code = self.swapchain.format();
         let scanout_code = if self.primary_is_opaque {
             get_opaque(code).unwrap_or(code)
@@ -1775,12 +1776,13 @@ where
         } else {
             self.normal_modifiers.clone()
         };
-        self.preferred_formats_usable = !modifiers.is_empty();
         if modifiers.is_empty() {
+            self.async_format_preference.record(enabled, false);
             debug!(?scanout_code, "No renderer-compatible asynchronous modifiers");
             return false;
         }
         if self.swapchain.modifiers() == modifiers.as_slice() {
+            self.async_format_preference.record(enabled, true);
             return true;
         }
         match Self::test_format(
@@ -1804,7 +1806,8 @@ where
                     .is_some_and(|mut buffer| renderer.bind(&mut buffer).is_ok());
                 if !importable {
                     debug!(enabled, "Keeping working swapchain after renderer import failed");
-                    self.preferred_formats_usable = false;
+                    self.async_format_preference
+                        .failed(enabled, std::time::Instant::now());
                     return false;
                 }
                 self.swapchain = swapchain;
@@ -1814,16 +1817,19 @@ where
                 self.reset_pending = true;
                 self.element_states.clear();
                 self.previous_element_states.clear();
+                self.async_format_preference.record(enabled, true);
+                true
             }
             Err((_, err)) => {
                 debug!(
                     ?err,
                     enabled, "Keeping working swapchain after format preference failed"
                 );
-                self.preferred_formats_usable = false;
+                self.async_format_preference
+                    .failed(enabled, std::time::Instant::now());
+                false
             }
         }
-        self.preferred_formats_usable
     }
 
     /// Render the next frame
@@ -2800,7 +2806,7 @@ where
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
         self.surface.reset_state()?;
         self.primary_buffer_state.invalidate();
-        self.async_format_preference = None;
+        self.async_format_preference = Default::default();
         self.reset_pending = true;
         Ok(())
     }
@@ -3118,8 +3124,7 @@ where
         .map_err(|(_, err)| err)?;
 
         self.normal_modifiers = swapchain.modifiers().to_vec();
-        self.async_format_preference = None;
-        self.preferred_formats_usable = true;
+        self.async_format_preference = Default::default();
         self.swapchain = swapchain;
         self.primary_buffer_state.invalidate();
         self.primary_is_opaque = is_oapque;

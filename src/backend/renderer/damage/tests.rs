@@ -5,7 +5,7 @@ use crate::{
     backend::renderer::{
         element::{Id, RenderElement},
         test::{DummyError, DummyFrame, DummyFramebuffer, DummyRenderer},
-        utils::CommitCounter,
+        utils::{CommitCounter, OpaqueRegions},
     },
     utils::{Buffer, Scale},
 };
@@ -17,6 +17,7 @@ struct TestElement {
     draws: Rc<Cell<usize>>,
     fail: bool,
     alpha: f32,
+    opaque: bool,
 }
 
 impl TestElement {
@@ -28,6 +29,7 @@ impl TestElement {
             draws: Rc::new(Cell::new(0)),
             fail: false,
             alpha: 1.0,
+            opaque: false,
         }
     }
 }
@@ -47,6 +49,13 @@ impl Element for TestElement {
     }
     fn alpha(&self) -> f32 {
         self.alpha
+    }
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        if self.opaque {
+            OpaqueRegions::from_slice(&[Rectangle::from_size(self.geometry.size)])
+        } else {
+            OpaqueRegions::default()
+        }
     }
 }
 
@@ -223,5 +232,63 @@ fn alpha_changes_redraw_without_a_new_buffer_commit() {
     render(&mut tracker, &element, 0, true).unwrap();
     element.alpha = 0.5;
     assert!(render(&mut tracker, &element, 2, true).is_some());
+    assert_eq!(element.draws.get(), 2);
+}
+
+#[test]
+fn hidden_surface_commits_are_drawn_when_the_surface_is_revealed() {
+    let mut tracker = tracker();
+    let mut elements = [TestElement::new(), TestElement::new()];
+    elements[0].geometry = Rectangle::from_size((100, 100).into());
+    elements[0].opaque = true;
+    let draw = |tracker: &mut OutputDamageTracker, elements: &[TestElement]| {
+        tracker
+            .render_output_if_changed(
+                &mut DummyRenderer,
+                &mut DummyFramebuffer,
+                1,
+                elements,
+                Color32F::BLACK,
+            )
+            .unwrap()
+            .damage
+            .cloned()
+    };
+    assert!(draw(&mut tracker, &elements).is_some());
+    assert_eq!(elements[1].draws.get(), 0);
+    elements[1].commit.increment();
+    assert!(draw(&mut tracker, &elements).is_none());
+    assert_eq!(elements[1].draws.get(), 0);
+    elements[0].geometry.loc = (50, 50).into();
+    let damage = draw(&mut tracker, &elements).unwrap();
+    assert!(damage.iter().any(|rect| rect.contains((10, 10))));
+    assert_eq!(elements[1].draws.get(), 1);
+}
+
+#[test]
+fn shrinking_opaque_coverage_redraws_without_a_buffer_commit() {
+    let mut tracker = tracker();
+    let mut element = TestElement::new();
+    element.opaque = true;
+    render(&mut tracker, &element, 0, true).unwrap();
+    assert!(render(&mut tracker, &element, 1, true).is_none());
+    element.opaque = false;
+    let damage = render(&mut tracker, &element, 1, true).unwrap();
+    assert!(damage.iter().any(|rect| rect.contains((10, 10))));
+    assert_eq!(element.draws.get(), 2);
+}
+
+#[test]
+fn output_transform_change_redraws_an_unchanged_scene() {
+    let mut tracker = tracker();
+    let element = TestElement::new();
+    render(&mut tracker, &element, 0, true).unwrap();
+    assert!(render(&mut tracker, &element, 1, true).is_none());
+    tracker.mode = OutputModeSource::Static {
+        size: (100, 100).into(),
+        scale: 1.0.into(),
+        transform: Transform::_180,
+    };
+    assert!(render(&mut tracker, &element, 1, true).is_some());
     assert_eq!(element.draws.get(), 2);
 }
