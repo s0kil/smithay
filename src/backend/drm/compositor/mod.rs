@@ -186,6 +186,7 @@ use super::{
 mod asynchronous;
 mod elements;
 mod frame_result;
+mod repaint;
 
 use elements::*;
 pub use frame_result::*;
@@ -1096,6 +1097,7 @@ where
     primary_is_opaque: bool,
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
+    primary_buffer_state: repaint::PrimaryBufferState<framebuffer::Handle>,
     supports_fencing: bool,
     reset_pending: bool,
     last_render_mode: PresentationMode,
@@ -1286,6 +1288,7 @@ where
                     let drm_renderer = DrmCompositor {
                         primary_plane_element_id: Id::new(),
                         primary_plane_damage_bag: DamageBag::new(4),
+                        primary_buffer_state: Default::default(),
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
                         signaled_fence,
@@ -1473,6 +1476,7 @@ where
         let drm_renderer = DrmCompositor {
             primary_plane_element_id: Id::new(),
             primary_plane_damage_bag: DamageBag::new(4),
+            primary_buffer_state: Default::default(),
             primary_is_opaque: is_opaque,
             reset_pending: true,
             signaled_fence,
@@ -1804,6 +1808,7 @@ where
                     return false;
                 }
                 self.swapchain = swapchain;
+                self.primary_buffer_state.invalidate();
                 debug!(enabled, modifiers = ?self.swapchain.modifiers(), "Updated composition modifiers");
                 self.primary_is_opaque = opaque;
                 self.reset_pending = true;
@@ -2428,15 +2433,41 @@ where
             let mut framebuffer = renderer
                 .bind(&mut dmabuf)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
-            let render_res =
+            // An unchanged scene can keep using the current primary buffer. Repairing an
+            // aged back buffer would otherwise cause an unnecessary render and page flip.
+            // Resets, pending modesets and transitions from direct scanout still need a
+            // fully rendered buffer, even if the damage tracker remembers the same scene.
+            // The last render might have been prepared but never submitted. In that case
+            // its damage history does not describe the current/pending scanout buffer.
+            let previous_composited_buffer = previous_state
+                .plane_buffer(self.surface.plane())
+                .filter(|buffer| matches!(buffer.buffer, ScanoutBuffer::Swapchain(_)))
+                .map(|buffer| buffer.fb.as_ref());
+            let can_reuse_primary = self
+                .primary_buffer_state
+                .can_reuse(previous_composited_buffer, allow_partial_update);
+            let render_res = if can_reuse_primary {
+                self.damage_tracker.render_output_if_changed(
+                    renderer,
+                    &mut framebuffer,
+                    age,
+                    &elements,
+                    clear_color,
+                )
+            } else {
                 self.damage_tracker
-                    .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
+                    .render_output(renderer, &mut framebuffer, age, &elements, clear_color)
+            };
 
             // restore the renderer debug flags
             renderer.set_debug_flags(renderer_debug_flags);
 
             match render_res {
                 Ok(render_output_result) => {
+                    if render_output_result.damage.is_some() {
+                        let buffer = next_frame_state.plane_buffer(self.surface.plane()).unwrap();
+                        self.primary_buffer_state.rendered(*buffer.fb.as_ref());
+                    }
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
                         // and we should trigger a cleanup of the renderer texture cache
@@ -2527,6 +2558,7 @@ where
                 Err(err) => {
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
+                    self.primary_buffer_state.invalidate();
                     self.swapchain.reset_buffers();
                     return Err(RenderFrameError::from(err));
                 }
@@ -2767,6 +2799,7 @@ where
     /// to reset it's internal state.
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
         self.surface.reset_state()?;
+        self.primary_buffer_state.invalidate();
         self.async_format_preference = None;
         self.reset_pending = true;
         Ok(())
@@ -2915,6 +2948,7 @@ where
 
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
+        self.primary_buffer_state.invalidate();
         self.swapchain.reset_buffers();
     }
 
@@ -2923,6 +2957,7 @@ where
     /// This can be used to efficiently clear the damage history without having to
     /// modify the damage for each surface.
     pub fn reset_buffer_ages(&mut self) {
+        self.primary_buffer_state.invalidate();
         self.swapchain.reset_buffer_ages();
     }
 
@@ -3038,6 +3073,7 @@ where
     pub fn set_debug_flags(&mut self, flags: DebugFlags) {
         if self.debug_flags != flags {
             self.debug_flags = flags;
+            self.primary_buffer_state.invalidate();
             self.swapchain.reset_buffers();
         }
     }
@@ -3085,6 +3121,7 @@ where
         self.async_format_preference = None;
         self.preferred_formats_usable = true;
         self.swapchain = swapchain;
+        self.primary_buffer_state.invalidate();
         self.primary_is_opaque = is_oapque;
 
         Ok(())

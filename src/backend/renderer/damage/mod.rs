@@ -103,6 +103,9 @@ use indexmap::IndexMap;
 use smallvec::{SmallVec, smallvec};
 use tracing::{info_span, instrument, trace, warn};
 
+#[cfg(test)]
+mod tests;
+
 use crate::{
     backend::renderer::{Frame, element::RenderElementPresentationState},
     output::{Output, OutputModeSource, OutputNoMode},
@@ -336,6 +339,45 @@ impl OutputDamageTracker {
         R: Renderer,
         R::TextureId: Texture,
     {
+        self.render_output_with_options(renderer, framebuffer, age, elements, clear_color, false)
+    }
+
+    /// Render only if the displayed scene changed, leaving an unchanged front buffer in use.
+    ///
+    /// Unlike `render_output`, this does not repair an aged back buffer when there is no new
+    /// damage. The caller must keep displaying its previous buffer if rendering is skipped.
+    #[cfg(any(test, all(feature = "wayland_frontend", feature = "backend_gbm")))]
+    pub(crate) fn render_output_if_changed<E, R>(
+        &mut self,
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        age: usize,
+        elements: &[E],
+        clear_color: impl Into<Color32F>,
+    ) -> Result<RenderOutputResult<'_>, Error<R::Error>>
+    where
+        E: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture,
+    {
+        self.render_output_with_options(renderer, framebuffer, age, elements, clear_color, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_output_with_options<E, R>(
+        &mut self,
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        age: usize,
+        elements: &[E],
+        clear_color: impl Into<Color32F>,
+        skip_unchanged: bool,
+    ) -> Result<RenderOutputResult<'_>, Error<R::Error>>
+    where
+        E: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture,
+    {
         let clear_color = clear_color.into();
         let (output_size, output_scale, output_transform) =
             std::convert::TryInto::<(Size<i32, Physical>, Scale<f64>, Transform)>::try_into(&self.mode)?;
@@ -360,6 +402,7 @@ impl OutputDamageTracker {
             Some(clear_color),
             &mut render_elements,
             None,
+            skip_unchanged,
         );
 
         if self.damage.is_empty() {
@@ -417,6 +460,7 @@ impl OutputDamageTracker {
             Some(clear_color),
             &mut render_elements,
             Some(&states),
+            false,
         );
 
         if self.damage.is_empty() {
@@ -461,6 +505,7 @@ impl OutputDamageTracker {
             self.last_state.clear_color,
             &mut render_elements,
             None,
+            false,
         );
 
         if self.damage.is_empty() {
@@ -482,6 +527,7 @@ impl OutputDamageTracker {
         clear_color: Option<Color32F>,
         render_elements: &mut Vec<&'a E>,
         with_states: Option<&RenderElementStates>,
+        skip_unchanged: bool,
     ) -> RenderElementStates
     where
         E: Element,
@@ -732,6 +778,14 @@ impl OutputDamageTracker {
                         .unwrap_or_default();
                 }
             }
+        }
+
+        // Buffer-age repair is not itself a change to the displayed scene. A compositor
+        // retaining its current front buffer can skip this frame entirely. Do not advance
+        // the damage history: the acquired back buffer has not been rendered or presented.
+        if skip_unchanged && self.damage.iter().all(Rectangle::is_empty) {
+            self.damage.clear();
+            return element_render_states;
         }
 
         // That is all completely new damage, which we need to store for subsequent renders
