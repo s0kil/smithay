@@ -74,6 +74,8 @@ use crate::{
     utils::{Buffer as BufferCoords, Physical, Rectangle, Size, Transform},
 };
 use tracing::{debug, info, info_span, instrument, trace, trace_span, warn};
+
+mod damage;
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
@@ -2426,6 +2428,7 @@ where
     }
 }
 
+#[profiling::function]
 fn dma_shadow_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2583,6 +2586,7 @@ type MemTexture<S, T> = (
     Option<Box<<<<T as GraphicsApi>::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>>,
 );
 
+#[profiling::function]
 fn mem_copy<S, T>(
     src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2605,23 +2609,7 @@ where
         .unwrap_or(Fourcc::Abgr8888);
 
     let texture_rect = Rectangle::from_size((src_texture.width() as i32, src_texture.height() as i32).into());
-    let damage = damage.map(|damage| {
-        damage
-            .iter()
-            .flat_map(|rect| rect.intersection(texture_rect))
-            .fold(Vec::<Rectangle<i32, BufferCoords>>::new(), |damage, mut rect| {
-                // replace with drain_filter, when that becomes stable to reuse the original Vec's memory
-                let (overlapping, mut new_damage): (Vec<_>, Vec<_>) = damage
-                    .into_iter()
-                    .partition(|other| other.overlaps_or_touches(rect));
-
-                for overlap in overlapping {
-                    rect = rect.merge(overlap);
-                }
-                new_damage.push(rect);
-                new_damage
-            })
-    });
+    let damage = damage.map(|damage| damage::merge_damage(damage, texture_rect));
 
     if slot.is_some() {
         let (mapping, texture) = slot.as_mut().unwrap();
@@ -2716,6 +2704,7 @@ where
     Ok(())
 }
 
+#[profiling::function]
 fn texture_copy<S, T>(
     src: &mut S::Device,
     target: &mut T::Device,
