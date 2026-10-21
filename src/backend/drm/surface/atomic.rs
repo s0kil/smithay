@@ -3,7 +3,8 @@ use drm::control::atomic::AtomicModeReq;
 use drm::control::connector::Interface;
 use drm::control::property::ValueType;
 use drm::control::{
-    AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
+    AtomicCommitFlags, Mode, PageFlipFlags, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer,
+    plane, property,
 };
 
 #[cfg(debug_assertions)]
@@ -173,6 +174,7 @@ pub struct AtomicDrmSurface {
     state: RwLock<State>,
     pending: RwLock<State>,
     pub(super) span: tracing::Span,
+    supports_async_page_flips: bool,
 }
 
 impl AtomicDrmSurface {
@@ -185,6 +187,7 @@ impl AtomicDrmSurface {
         prop_mapping: Arc<RwLock<PropMapping>>,
         mode: Mode,
         connectors: &[connector::Handle],
+        supports_async_page_flips: bool,
     ) -> Result<Self, Error> {
         let span = info_span!("drm_atomic", crtc = ?crtc);
         let _guard = span.enter();
@@ -210,6 +213,7 @@ impl AtomicDrmSurface {
         };
 
         drop(_guard);
+
         let surface = AtomicDrmSurface {
             fd,
             active,
@@ -220,6 +224,7 @@ impl AtomicDrmSurface {
             state: RwLock::new(state),
             pending: RwLock::new(pending),
             span,
+            supports_async_page_flips,
         };
 
         Ok(surface)
@@ -273,6 +278,10 @@ impl AtomicDrmSurface {
                 Err(err)
             }
         }
+    }
+
+    pub fn supports_async_page_flips(&self) -> bool {
+        self.supports_async_page_flips
     }
 
     pub fn current_connectors(&self) -> HashSet<connector::Handle> {
@@ -695,6 +704,7 @@ impl AtomicDrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         allow_modeset: bool,
+        async_commit: bool,
     ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -703,13 +713,14 @@ impl AtomicDrmSurface {
         let current = self.state.read().unwrap();
         let pending = self.pending.read().unwrap();
 
-        self.test_state_internal(planes, allow_modeset, &current, &pending)
+        self.test_state_internal(planes, allow_modeset, async_commit, &current, &pending)
     }
 
     fn test_state_internal<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         allow_modeset: bool,
+        async_commit: bool,
         current: &'_ State,
         pending: &'_ State,
     ) -> Result<(), Error> {
@@ -730,11 +741,15 @@ impl AtomicDrmSurface {
             &*planes,
         )?;
 
-        let flags = if allow_modeset {
-            AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY
-        } else {
-            AtomicCommitFlags::TEST_ONLY
-        };
+        let mut flags = AtomicCommitFlags::TEST_ONLY;
+        if allow_modeset {
+            flags |= AtomicCommitFlags::ALLOW_MODESET;
+        }
+
+        if async_commit {
+            flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+        }
+
         self.fd.atomic_commit(flags, req.build()?).map_err(|source| {
             Error::Access(AccessError {
                 errmsg: "Error testing state",
@@ -744,13 +759,26 @@ impl AtomicDrmSurface {
         })
     }
 
+    fn flip_flags(&self, value: PageFlipFlags) -> AtomicCommitFlags {
+        let mut v = AtomicCommitFlags::empty();
+        if value.contains(PageFlipFlags::EVENT) {
+            v |= AtomicCommitFlags::PAGE_FLIP_EVENT;
+        }
+        if self.supports_async_page_flips && value.contains(PageFlipFlags::ASYNC) {
+            v |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+        }
+        v
+    }
+
     #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
     #[profiling::function]
     pub fn commit<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
-        event: bool,
+        flip_flags: super::PageFlipFlags,
     ) -> Result<(), Error> {
+        let flip_flags = self.flip_flags(flip_flags);
+
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -825,9 +853,9 @@ impl AtomicDrmSurface {
         let result = self
             .fd
             .atomic_commit(
-                if event {
+                if flip_flags.contains(AtomicCommitFlags::PAGE_FLIP_EVENT) {
                     // on the atomic api we can modeset and trigger a page_flip event on the same call!
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::ALLOW_MODESET
+                    flip_flags | AtomicCommitFlags::ALLOW_MODESET
                     // we also *should* not need to wait for completion, like with `set_crtc`,
                     // because we have tested this exact commit already, so we do not expect any errors later down the line.
                     //
@@ -868,8 +896,10 @@ impl AtomicDrmSurface {
     pub fn page_flip<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
-        event: bool,
+        flip_flags: PageFlipFlags,
     ) -> Result<(), Error> {
+        let flip_flags = self.flip_flags(flip_flags);
+
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -895,14 +925,7 @@ impl AtomicDrmSurface {
         trace!(?planes, "Queueing page flip: {:?}", req);
         let res = self
             .fd
-            .atomic_commit(
-                if event {
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
-                } else {
-                    AtomicCommitFlags::NONBLOCK
-                },
-                req.build()?,
-            )
+            .atomic_commit(flip_flags | AtomicCommitFlags::NONBLOCK, req.build()?)
             .map_err(|source| {
                 Error::Access(AccessError {
                     errmsg: "Page flip commit failed",

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use drm::Device as BasicDevice;
-use drm::control::{Device as ControlDevice, Mode, connector, crtc, framebuffer, plane};
+use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, connector, crtc, framebuffer, plane};
 
 use libc::dev_t;
 
@@ -385,8 +385,28 @@ impl DrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         allow_modeset: bool,
     ) -> Result<(), Error> {
+        self.test_state_with_mode(planes, allow_modeset, false)
+    }
+
+    /// Test a plane configuration, optionally as an asynchronous flip.
+    pub fn test_state_with_mode<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        allow_modeset: bool,
+        async_commit: bool,
+    ) -> Result<(), Error> {
+        if async_commit && (allow_modeset || !self.supports_async_page_flips()) {
+            return Err(Error::Access(super::error::AccessError {
+                errmsg: "Unsupported asynchronous test",
+                dev: self.dev_path(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "async requires supported hardware and cannot modeset",
+                ),
+            }));
+        }
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.test_state(planes, allow_modeset),
+            DrmSurfaceInternal::Atomic(surf) => surf.test_state(planes, allow_modeset, async_commit),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
 
@@ -418,11 +438,16 @@ impl DrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        let flip_flags = if event {
+            PageFlipFlags::EVENT
+        } else {
+            PageFlipFlags::empty()
+        };
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, flip_flags),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
-                surf.commit(fb, event)
+                surf.commit(fb, flip_flags)
             }
         }
     }
@@ -440,11 +465,45 @@ impl DrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.page_flip_with_flags(
+            planes,
+            if event {
+                PageFlipFlags::EVENT
+            } else {
+                PageFlipFlags::empty()
+            },
+        )
+    }
+
+    /// Whether this device advertises asynchronous page flips for this backend.
+    pub fn supports_async_page_flips(&self) -> bool {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event),
+            DrmSurfaceInternal::Atomic(surface) => surface.supports_async_page_flips(),
+            DrmSurfaceInternal::Legacy(surface) => surface.supports_async_page_flips(),
+        }
+    }
+
+    /// Flip with explicit event and asynchronous-presentation flags.
+    /// Unsupported async requests are rejected, never silently reported as async.
+    pub fn page_flip_with_flags<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        flip_flags: PageFlipFlags,
+    ) -> Result<(), Error> {
+        if !(flip_flags - (PageFlipFlags::EVENT | PageFlipFlags::ASYNC)).is_empty()
+            || (flip_flags.contains(PageFlipFlags::ASYNC) && !self.supports_async_page_flips())
+        {
+            return Err(Error::Access(super::error::AccessError {
+                errmsg: "Unsupported page flip flags",
+                dev: self.dev_path(),
+                source: io::Error::new(io::ErrorKind::Unsupported, "unsupported page flip flags"),
+            }));
+        }
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, flip_flags),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
-                surf.page_flip(fb, event)
+                surf.page_flip(fb, flip_flags)
             }
         }
     }

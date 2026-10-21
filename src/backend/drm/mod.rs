@@ -145,6 +145,8 @@ pub struct PlaneInfo {
     pub zpos: Option<i32>,
     /// Formats supported by this plane
     pub formats: FormatSet,
+    /// Async formats supported by this plane
+    pub formats_async: Option<FormatSet>,
     /// Recommended plane size in order of preference
     pub size_hints: Option<Vec<Size<u16, Physical>>>,
 }
@@ -187,12 +189,26 @@ fn planes(
             let zpos = plane_zpos(dev, plane).ok().flatten();
             let type_ = plane_type(dev, plane)?;
             let formats = plane_formats(dev, plane)?;
+            let formats_async = match plane_formats_async(dev, plane) {
+                Ok(formats) => formats,
+                Err(err) => {
+                    // This optional property must never prevent synchronized
+                    // output setup. Fail closed for async, not for the output.
+                    tracing::warn!(
+                        ?plane,
+                        ?err,
+                        "Unable to read async formats; disabling async on plane"
+                    );
+                    Some(FormatSet::from_formats(IndexSet::new()))
+                }
+            };
             let size_hints = plane_size_hints(dev, plane)?;
             let plane_info = PlaneInfo {
                 handle: plane,
                 type_,
                 zpos,
                 formats,
+                formats_async,
                 size_hints,
             };
             match type_ {
@@ -406,6 +422,91 @@ fn plane_formats(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> 
     );
 
     Ok(FormatSet::from_formats(formats))
+}
+
+mod format_blob;
+
+fn plane_formats_async(
+    dev: &(impl ControlDevice + DevPath),
+    plane: plane::Handle,
+) -> Result<Option<FormatSet>, DrmError> {
+    let Ok(1) = dev.get_driver_capability(DriverCapability::AddFB2Modifiers) else {
+        return Ok(None);
+    };
+
+    let set = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to query properties",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?;
+    let (handles, _) = set.as_props_and_values();
+
+    // for every handle ...
+    let prop = handles
+        .iter()
+        .find(|handle| {
+            // get information of that property
+            if let Ok(info) = dev.get_property(**handle) {
+                // to find out, if we got the handle of the "IN_FORMATS_ASYNC" property ...
+                if info
+                    .name()
+                    .to_str()
+                    .map(|x| x == "IN_FORMATS_ASYNC")
+                    .unwrap_or(false)
+                {
+                    // so we can use that to get formats
+                    return true;
+                }
+            }
+            false
+        })
+        .copied();
+
+    let Some(prop) = prop else {
+        return Ok(None);
+    };
+
+    let prop_info = dev.get_property(prop).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to query property",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?;
+    let (handles, raw_values) = set.as_props_and_values();
+    let raw_value = raw_values[handles
+        .iter()
+        .enumerate()
+        .find_map(|(i, handle)| if *handle == prop { Some(i) } else { None })
+        .unwrap()];
+
+    let drm::control::property::Value::Blob(blob) = prop_info.value_type().convert_value(raw_value) else {
+        return Ok(None);
+    };
+
+    let data = dev.get_property_blob(blob).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to query property blob data",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?;
+
+    let mut formats = IndexSet::new();
+
+    formats.extend(format_blob::parse(&data).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Invalid asynchronous format modifier blob",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?);
+
+    trace!("Supported async formats for plane ({:?}): {:?}", plane, formats);
+
+    Ok(Some(FormatSet::from_formats(formats)))
 }
 
 #[cfg(feature = "backend_gbm")]

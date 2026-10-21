@@ -4,3 +4,8 @@ Cargo.lock
 .vscode
 .vagga
 /wlcs
+
+# Local research and tool state
+/.codegraph/
+/.serena/
+/docs/tearing.md

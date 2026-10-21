@@ -25,7 +25,11 @@ pub fn select_dmabuf_feedback<'a>(
             Some(RenderingReason::FormatUnsupported) | Some(RenderingReason::ScanoutFailed) => {
                 scanout_feedback
             }
-            None => default_feedback,
+            // The synchronous scan-out tranche may contain the same format
+            // rejected for async. Do not encourage the client to retry it.
+            Some(RenderingReason::AsyncFormatUnsupported | RenderingReason::AsyncScanoutFailed) | None => {
+                default_feedback
+            }
         },
         RenderElementPresentationState::ZeroCopy => scanout_feedback,
         RenderElementPresentationState::Skipped => default_feedback,

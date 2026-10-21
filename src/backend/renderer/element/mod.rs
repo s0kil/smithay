@@ -266,6 +266,10 @@ pub enum RenderingReason {
     FormatUnsupported,
     /// Element was selected for direct scan-out but failed
     ScanoutFailed,
+    /// The element format cannot be scanned out asynchronously.
+    AsyncFormatUnsupported,
+    /// Asynchronous scan-out failed; synchronized scan-out may still work.
+    AsyncScanoutFailed,
 }
 
 /// Defines the presentation state of an element after rendering

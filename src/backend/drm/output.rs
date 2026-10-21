@@ -11,6 +11,8 @@ use std::{
 use drm::control::{self, Mode, connector, crtc};
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 
+use super::compositor::FrameRef;
+
 use crate::{
     backend::{
         allocator::{
@@ -18,7 +20,10 @@ use crate::{
             dmabuf::{AsDmabuf, Dmabuf},
             gbm::GbmDevice,
         },
-        renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
+        renderer::{
+            Bind, Color32F, DebugFlags, PresentationMode, Renderer, RendererSuper, Texture,
+            element::RenderElement,
+        },
     },
     output::OutputModeSource,
 };
@@ -99,7 +104,7 @@ where
     }
 }
 
-impl<'a, A, F, U, G> fmt::Debug for LockedDrmOutputManager<'a, A, F, U, G>
+impl<A, F, U, G> fmt::Debug for LockedDrmOutputManager<'_, A, F, U, G>
 where
     A: Allocator + fmt::Debug,
     <A as Allocator>::Buffer: fmt::Debug,
@@ -150,7 +155,7 @@ where
     }
 }
 
-impl<'a, A, F, U, G> LockedDrmOutputManager<'a, A, F, U, G>
+impl<A, F, U, G> LockedDrmOutputManager<'_, A, F, U, G>
 where
     A: Allocator,
     F: ExportFramebuffer<<A as Allocator>::Buffer>,
@@ -277,7 +282,7 @@ where
     }
 }
 
-impl<'a, A, F, U, G> LockedDrmOutputManager<'a, A, F, U, G>
+impl<A, F, U, G> LockedDrmOutputManager<'_, A, F, U, G>
 where
     A: Allocator + std::clone::Clone + std::fmt::Debug,
     <A as Allocator>::Buffer: AsDmabuf,
@@ -671,6 +676,22 @@ where
         self.with_compositor(|compositor| compositor.reset_buffers());
     }
 
+    /// Access the currently pending frame without submitting it
+    pub fn with_pending_frame<T, R>(&self, f: T) -> R
+    where
+        T: Fn(Option<FrameRef<'_, U>>) -> R,
+    {
+        self.with_compositor(|compositor| f(compositor.pending_frame()))
+    }
+
+    /// Access the currently queued frame
+    pub fn with_queued_frame<T, R>(&self, f: T) -> R
+    where
+        T: Fn(Option<FrameRef<'_, U>>) -> R,
+    {
+        self.with_compositor(|compositor| f(compositor.queued_frame()))
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`]
@@ -702,8 +723,33 @@ where
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
+        self.render_frame_with_mode(
+            renderer,
+            elements,
+            clear_color,
+            frame_mode,
+            PresentationMode::VSync,
+        )
+    }
+
+    /// Render with a presentation preference; use [`Self::with_pending_frame`]
+    /// to inspect the mode actually submitted to the device.
+    pub fn render_frame_with_mode<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_mode: FrameFlags,
+        presentation_mode: PresentationMode,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
         self.with_compositor(|compositor| {
-            compositor.render_frame(renderer, elements, clear_color, frame_mode)
+            compositor.render_frame_with_mode(renderer, elements, clear_color, frame_mode, presentation_mode)
         })
     }
 
@@ -813,8 +859,8 @@ where
     }
 }
 
-fn use_mode_internal<'a, A, F, U, G, R, E>(
-    compositor_list: &mut RwLockWriteGuard<'a, HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>>,
+fn use_mode_internal<A, F, U, G, R, E>(
+    compositor_list: &mut RwLockWriteGuard<'_, HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>>,
     crtc: &crtc::Handle,
     mode: Mode,
     allocator: &A,
