@@ -31,8 +31,8 @@ use crate::{
 use super::{
     DrmDevice, DrmError, Planes,
     compositor::{
-        DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
-        RenderFrameErrorType, RenderFrameResult,
+        DrmCompositor, FrameError, FrameErrorType, FrameFlags, FrameResult, FrameSubmitted,
+        PrimaryPlaneElement, RenderFrameError, RenderFrameErrorType, RenderFrameResult,
     },
     exporter::ExportFramebuffer,
 };
@@ -697,8 +697,21 @@ where
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`]
     /// was received after calling [`DrmOutput::queue_frame`] on this surface.
     /// Otherwise the underlying swapchain will run out of buffers eventually.
+    ///
+    /// This compatibility method cannot return completed user data together with
+    /// a successor submission error. Use [`Self::frame_submitted_with_result`]
+    /// when the completion must be delivered independently of that error.
     pub fn frame_submitted(&self) -> FrameResult<Option<U>, A, F> {
         self.with_compositor(|compositor| compositor.frame_submitted())
+    }
+
+    /// Complete the pending frame and return the next submission's result separately.
+    ///
+    /// Unlike [`Self::frame_submitted`], completed frame data remains available if
+    /// submitting the next queued frame fails. See
+    /// [`DrmCompositor::frame_submitted_with_result`] for the resulting queue state.
+    pub fn frame_submitted_with_result(&self) -> Option<FrameSubmitted<U, FrameErrorType<A, F>>> {
+        self.with_compositor(|compositor| compositor.frame_submitted_with_result())
     }
 
     /// Get the format of the underlying swapchain

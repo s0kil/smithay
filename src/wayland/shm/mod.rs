@@ -113,6 +113,8 @@ use wayland_server::{
 
 mod handlers;
 mod pool;
+#[cfg(test)]
+mod tests;
 
 use crate::{
     backend::allocator::format::get_bpp,

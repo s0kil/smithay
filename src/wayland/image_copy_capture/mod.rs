@@ -1196,7 +1196,7 @@ where
         &self,
         _state: &mut D,
         _client: &Client,
-        _resource: &ExtImageCopyCaptureCursorSessionV1,
+        resource: &ExtImageCopyCaptureCursorSessionV1,
         request: ext_image_copy_capture_cursor_session_v1::Request,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -1206,7 +1206,10 @@ where
                 let mut inner = self.inner.lock().unwrap();
 
                 if inner.session_obj.is_some() {
-                    // Protocol error: only one session allowed
+                    resource.post_error(
+                        ext_image_copy_capture_cursor_session_v1::Error::DuplicateSession,
+                        "get_capture_session sent more than once",
+                    );
                     return;
                 }
 
@@ -1405,5 +1408,141 @@ where
         }
 
         state.frame_aborted(frame_ref);
+    }
+}
+
+#[cfg(test)]
+mod cursor_session_tests {
+    use std::{
+        os::unix::net::UnixStream,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use wayland_client::{
+        Connection, Dispatch as ClientDispatch, QueueHandle, delegate_noop,
+        globals::{GlobalListContents, registry_queue_init},
+        protocol::wl_registry,
+    };
+    use wayland_protocols::ext::image_copy_capture::v1::client::{
+        ext_image_copy_capture_cursor_session_v1 as client_cursor,
+        ext_image_copy_capture_session_v1 as client_session,
+    };
+    use wayland_server::Display;
+
+    use super::*;
+
+    struct Server(ImageCopyCaptureState);
+    crate::delegate_dispatch2!(Server);
+
+    impl ImageCopyCaptureHandler for Server {
+        fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+            &mut self.0
+        }
+        fn capture_constraints(&mut self, _: &ImageCaptureSource) -> Option<BufferConstraints> {
+            None
+        }
+        fn new_session(&mut self, _: Session) {}
+        fn frame(&mut self, _: &SessionRef, _: Frame) {}
+    }
+
+    struct PointerData;
+    impl Dispatch2<WlPointer, Server> for PointerData {
+        fn request(
+            &self,
+            _: &mut Server,
+            _: &Client,
+            _: &WlPointer,
+            _: wayland_server::protocol::wl_pointer::Request,
+            _: &DisplayHandle,
+            _: &mut DataInit<'_, Server>,
+        ) {
+        }
+    }
+
+    // Expose the cursor directly in this fixture to exercise its dispatch without
+    // requiring a compositor output, seat, capture permission or rendering.
+    struct CursorGlobal;
+    impl GlobalDispatch2<ExtImageCopyCaptureCursorSessionV1, Server> for CursorGlobal {
+        fn bind(
+            &self,
+            _: &mut Server,
+            dh: &DisplayHandle,
+            client: &Client,
+            resource: New<ExtImageCopyCaptureCursorSessionV1>,
+            data_init: &mut DataInit<'_, Server>,
+        ) {
+            let pointer = client
+                .create_resource::<WlPointer, _, Server>(dh, 1, PointerData)
+                .unwrap();
+            data_init.init(
+                resource,
+                CursorSessionData {
+                    inner: Arc::new(Mutex::new(CursorSessionInner::new(
+                        ImageCaptureSource::new(),
+                        pointer,
+                    ))),
+                    user_data: Arc::new(UserDataMap::new()),
+                },
+            );
+        }
+    }
+
+    struct TestClient;
+    impl ClientDispatch<wl_registry::WlRegistry, GlobalListContents> for TestClient {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    delegate_noop!(TestClient: ignore client_cursor::ExtImageCopyCaptureCursorSessionV1);
+    delegate_noop!(TestClient: ignore client_session::ExtImageCopyCaptureSessionV1);
+
+    #[test]
+    fn duplicate_cursor_capture_session_is_a_protocol_error() {
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = thread::spawn(move || {
+            let mut display = Display::<Server>::new().unwrap();
+            let mut handle = display.handle();
+            let mut state = Server(ImageCopyCaptureState::new::<Server>(&handle));
+            handle.create_global::<Server, ExtImageCopyCaptureCursorSessionV1, _>(1, CursorGlobal);
+            handle.insert_client(server_socket, Arc::new(())).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !server_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                display.dispatch_clients(&mut state).unwrap();
+                display.flush_clients().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let qh = queue.handle();
+        let cursor: client_cursor::ExtImageCopyCaptureCursorSessionV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+        let _first = cursor.get_capture_session(&qh, ());
+        queue.roundtrip(&mut TestClient).unwrap();
+        let _duplicate = cursor.get_capture_session(&qh, ());
+        let result = queue.roundtrip(&mut TestClient);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            connection
+                .protocol_error()
+                .expect("expected a protocol error")
+                .code,
+            client_cursor::Error::DuplicateSession as u32,
+        );
     }
 }

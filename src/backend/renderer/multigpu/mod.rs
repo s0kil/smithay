@@ -1570,6 +1570,9 @@ where
             if let Some(target) = self.target.as_mut() {
                 if let Some(texture) = target.texture.as_ref() {
                     // try gpu copy
+                    trace!(stage = "output_transfer", path = "dma_gpu", source = ?render.node(),
+                        target = ?target.device.node(), format = ?target.format, rectangles = ?damage,
+                        "Transferring rendered output");
                     let damage = damage
                         .iter()
                         .map(|rect| rect.to_logical(1, Transform::Normal, &buffer_size).to_physical(1))
@@ -1620,22 +1623,14 @@ where
                 damage.retain(|rect| rect.overlaps_or_touches(Rectangle::from_size(buffer_size)));
                 damage.retain(|rect| rect.size.h > 0 && rect.size.w > 0);
 
-                let mut copy_rects = // merge overlapping rectangles
-                    damage.iter().cloned().fold(Vec::new(), |new_damage, mut rect| {
-                        // replace with drain_filter, when that becomes stable to reuse the original Vec's memory
-                        let (overlapping, mut new_damage): (Vec<_>, Vec<_>) = new_damage
-                            .into_iter()
-                            .partition(|other: &Rectangle<i32, BufferCoords>| other.overlaps_or_touches(rect));
-
-                        for overlap in overlapping {
-                            rect = rect.merge(overlap);
-                        }
-                        new_damage.push(rect);
-                        new_damage
-                    });
+                let mut copy_rects = damage::merge_damage_unclipped(&damage);
                 if copy_rects.len() > MAX_CPU_COPIES {
                     copy_rects = Vec::from([Rectangle::from_size(buffer_size)]);
                 }
+                trace!(stage = "output_transfer", path = "cpu", source = ?render.node(),
+                    target = ?target.device.node(), ?format, rectangles = ?copy_rects,
+                    estimated_bytes = ?copy_byte_count(&copy_rects, format),
+                    "Transferring rendered output");
 
                 let mut mappings = Vec::new();
                 for rect in copy_rects {
@@ -2318,6 +2313,8 @@ where
         dmabuf: &Dmabuf,
         damage: Option<&[Rectangle<i32, BufferCoords>]>,
     ) -> Result<<Self as RendererSuper>::TextureId, <Self as RendererSuper>::Error> {
+        trace!(stage = "client_import", source = ?dmabuf.node(), render = ?self.render.node(),
+            format = ?dmabuf.format(), size = ?dmabuf.size(), "Importing client buffer");
         let texture = MultiTexture::new(dmabuf.size(), dmabuf.format());
         import_dmabuf_internal(
             self.render,
@@ -2534,6 +2531,9 @@ where
         (slot.insert((shadow_buffer, target_texture, None)), true)
     };
 
+    trace!(stage = "client_transfer", path = "dma_shadow", source = ?src.node(),
+        target = ?target.as_ref().map(|device| device.node()), format = ?shadow_buffer.format(),
+        ?damage, new_buffer = is_new_buffer, "Copying client texture through DMA shadow");
     let src_renderer = src.renderer_mut();
     if let Some(sync) = existing_sync_point.take() {
         if let Err(err) = src_renderer.wait(&sync) {
@@ -2576,6 +2576,17 @@ where
     Ok(())
 }
 
+// Payload estimate only: this does not include driver padding, compression or bus traffic.
+fn copy_byte_count(rectangles: &[Rectangle<i32, BufferCoords>], format: Fourcc) -> Option<u64> {
+    let bpp = u64::try_from(get_bpp(format)?).ok()?;
+    rectangles.iter().try_fold(0u64, |bytes, rect| {
+        let pixels = u64::try_from(rect.size.w)
+            .ok()?
+            .checked_mul(u64::try_from(rect.size.h).ok()?)?;
+        bytes.checked_add(pixels.checked_mul(bpp)? / 8)
+    })
+}
+
 type BoxedTextureMappingAndDamage<S> = (
     Box<<<<S as GraphicsApi>::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>,
     Rectangle<i32, BufferCoords>,
@@ -2610,6 +2621,10 @@ where
 
     let texture_rect = Rectangle::from_size((src_texture.width() as i32, src_texture.height() as i32).into());
     let damage = damage.map(|damage| damage::merge_damage(damage, texture_rect));
+    trace!(stage = "client_transfer", path = "cpu", source = ?src.node(), target = ?target.node(),
+        ?format, rectangles = ?damage,
+        estimated_bytes = ?copy_byte_count(damage.as_deref().unwrap_or(&[texture_rect]), format),
+        "Copying client texture through memory");
 
     if slot.is_some() {
         let (mapping, texture) = slot.as_mut().unwrap();

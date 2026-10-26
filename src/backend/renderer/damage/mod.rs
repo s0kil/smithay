@@ -346,7 +346,7 @@ impl OutputDamageTracker {
     ///
     /// Unlike `render_output`, this does not repair an aged back buffer when there is no new
     /// damage. The caller must keep displaying its previous buffer if rendering is skipped.
-    #[cfg(any(test, all(feature = "wayland_frontend", feature = "backend_gbm")))]
+    #[cfg(test)]
     pub(crate) fn render_output_if_changed<E, R>(
         &mut self,
         renderer: &mut R,
@@ -361,6 +361,42 @@ impl OutputDamageTracker {
         R::TextureId: Texture,
     {
         self.render_output_with_options(renderer, framebuffer, age, elements, clear_color, true)
+    }
+
+    /// Like `render_output_if_changed`, but only acquires a framebuffer when rendering is needed.
+    ///
+    /// The framebuffer lifetime belongs to the target captured by `bind`, not the renderer.
+    /// A failed bind invalidates the prepared damage history, just like a failed render.
+    #[cfg(any(test, all(feature = "wayland_frontend", feature = "backend_gbm")))]
+    pub(crate) fn render_output_if_changed_with_bind<'buffer, E, R, F>(
+        &mut self,
+        renderer: &mut R,
+        bind: F,
+        age: usize,
+        elements: &[E],
+        clear_color: impl Into<Color32F>,
+    ) -> Result<RenderOutputResult<'_>, Error<R::Error>>
+    where
+        E: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture,
+        F: FnOnce(&mut R) -> Result<R::Framebuffer<'buffer>, R::Error>,
+    {
+        let clear_color = clear_color.into();
+        let (render_elements, states) = self.prepare_render_output(age, elements, clear_color, true)?;
+        if self.damage.is_empty() {
+            trace!("no damage, skipping framebuffer binding and rendering");
+            return Ok(RenderOutputResult::skipped(states));
+        }
+
+        let mut framebuffer = match bind(renderer) {
+            Ok(framebuffer) => framebuffer,
+            Err(err) => {
+                self.last_state = Default::default();
+                return Err(Error::Rendering(err));
+            }
+        };
+        self.render_output_internal(renderer, &mut framebuffer, &render_elements, clear_color, states)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -379,6 +415,24 @@ impl OutputDamageTracker {
         R::TextureId: Texture,
     {
         let clear_color = clear_color.into();
+        let (render_elements, states) =
+            self.prepare_render_output(age, elements, clear_color, skip_unchanged)?;
+
+        if self.damage.is_empty() {
+            trace!("no damage, skipping rendering");
+            return Ok(RenderOutputResult::skipped(states));
+        }
+
+        self.render_output_internal(renderer, framebuffer, &render_elements, clear_color, states)
+    }
+
+    fn prepare_render_output<'e, E: Element>(
+        &mut self,
+        age: usize,
+        elements: &'e [E],
+        clear_color: Color32F,
+        skip_unchanged: bool,
+    ) -> Result<(Vec<&'e E>, RenderElementStates), OutputNoMode> {
         let (output_size, output_scale, output_transform) =
             std::convert::TryInto::<(Size<i32, Physical>, Scale<f64>, Transform)>::try_into(&self.mode)?;
 
@@ -405,12 +459,7 @@ impl OutputDamageTracker {
             skip_unchanged,
         );
 
-        if self.damage.is_empty() {
-            trace!("no damage, skipping rendering");
-            return Ok(RenderOutputResult::skipped(states));
-        }
-
-        self.render_output_internal(renderer, framebuffer, &render_elements, clear_color, states)
+        Ok((render_elements, states))
     }
 
     /// Render this output with the provided [`Renderer`] and provided states.

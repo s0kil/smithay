@@ -226,6 +226,55 @@ fn failed_render_does_not_make_the_retry_look_unchanged() {
 }
 
 #[test]
+fn unchanged_scene_does_not_bind_a_framebuffer_or_advance_history() {
+    let mut tracker = tracker();
+    let element = TestElement::new();
+    let binds = Cell::new(0);
+    let draw = |tracker: &mut OutputDamageTracker, age| {
+        tracker
+            .render_output_if_changed_with_bind(
+                &mut DummyRenderer,
+                |_| {
+                    binds.set(binds.get() + 1);
+                    Ok(DummyFramebuffer)
+                },
+                age,
+                std::slice::from_ref(&element),
+                Color32F::BLACK,
+            )
+            .unwrap()
+            .damage
+            .is_some()
+    };
+    assert!(draw(&mut tracker, 0));
+    let history = tracker.last_state.old_damage.clone();
+    for age in [0, 1, 2, 4] {
+        assert!(!draw(&mut tracker, age));
+        assert_eq!(tracker.last_state.old_damage, history);
+    }
+    assert_eq!(binds.get(), 1);
+    assert_eq!(element.draws.get(), 1);
+}
+
+#[test]
+fn failed_lazy_bind_forces_a_full_redraw_on_retry() {
+    let mut tracker = tracker();
+    let mut element = TestElement::new();
+    render(&mut tracker, &element, 0, true).unwrap();
+    element.commit.increment();
+    let result = tracker.render_output_if_changed_with_bind(
+        &mut DummyRenderer,
+        |_| Err(DummyError::SyncInterrupted),
+        1,
+        std::slice::from_ref(&element),
+        Color32F::BLACK,
+    );
+    assert!(result.is_err());
+    let damage = render(&mut tracker, &element, 1, true).unwrap();
+    assert!(damage.iter().any(|r| r.contains((99, 99))));
+}
+
+#[test]
 fn alpha_changes_redraw_without_a_new_buffer_commit() {
     let mut tracker = tracker();
     let mut element = TestElement::new();

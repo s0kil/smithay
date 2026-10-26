@@ -251,11 +251,7 @@ impl EGLBuffer {
 
     /// Returns the `EGLImage` handle for a given plane
     pub fn image(&self, plane: usize) -> Option<EGLImage> {
-        if plane > self.format.num_planes() {
-            None
-        } else {
-            Some(self.images[plane])
-        }
+        self.images.get(plane).copied()
     }
 
     /// Returns the underlying images

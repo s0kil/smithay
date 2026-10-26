@@ -38,6 +38,7 @@ pub struct DrmSurface {
 struct PlaneDamageInner {
     drm: DrmDeviceFd,
     blob: Option<drm::control::property::Value<'static>>,
+    rects: Vec<drm_ffi::drm_mode_rect>,
 }
 
 impl Drop for PlaneDamageInner {
@@ -73,9 +74,23 @@ impl PlaneDamageClips {
         damage_transform: Transform,
         damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
     ) -> io::Result<Option<Self>> {
+        Self::from_damage_with_previous(device, src, dst, dst_transform, damage_transform, damage, None)
+    }
+
+    /// Reuse only the preceding blob, and only for identical device-local clips.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_damage_with_previous(
+        device: &DrmDeviceFd,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        dst_transform: Transform,
+        damage_transform: Transform,
+        damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
+        previous: Option<&Self>,
+    ) -> io::Result<Option<Self>> {
         let scale = src.size / dst.size.to_logical(1).to_buffer(1, dst_transform).to_f64();
 
-        let mut rects = damage
+        let rects = damage
             .into_iter()
             .map(|rect| {
                 let mut rect = rect
@@ -103,22 +118,45 @@ impl PlaneDamageClips {
             return Ok(None);
         }
 
-        let data = unsafe {
-            std::slice::from_raw_parts_mut(
-                rects.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<drm_ffi::drm_mode_rect>() * rects.len(),
-            )
-        };
-
-        let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)?;
-
-        Ok(Some(PlaneDamageClips {
-            inner: Arc::new(PlaneDamageInner {
-                drm: device.clone(),
-                blob: Some(drm::control::property::Value::Blob(blob.blob_id as u64)),
-            }),
-        }))
+        let previous = previous.filter(|previous| previous.inner.drm == *device);
+        reuse_or_create_damage(
+            rects,
+            previous.map(|previous| (&*previous.inner.rects, &previous.inner)),
+            |mut rects| {
+                let data = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        rects.as_mut_ptr() as *mut u8,
+                        std::mem::size_of::<drm_ffi::drm_mode_rect>() * rects.len(),
+                    )
+                };
+                let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)?;
+                Ok(Arc::new(PlaneDamageInner {
+                    drm: device.clone(),
+                    blob: Some(drm::control::property::Value::Blob(blob.blob_id as u64)),
+                    rects,
+                }))
+            },
+        )
+        .map(|inner| Some(PlaneDamageClips { inner }))
     }
+}
+
+fn reuse_or_create_damage<T: Clone>(
+    rects: Vec<drm_ffi::drm_mode_rect>,
+    previous: Option<(&[drm_ffi::drm_mode_rect], &T)>,
+    create: impl FnOnce(Vec<drm_ffi::drm_mode_rect>) -> io::Result<T>,
+) -> io::Result<T> {
+    if let Some((old_rects, value)) = previous {
+        let same = old_rects.len() == rects.len()
+            && old_rects
+                .iter()
+                .zip(&rects)
+                .all(|(old, new)| (old.x1, old.y1, old.x2, old.y2) == (new.x1, new.y1, new.x2, new.y2));
+        if same {
+            return Ok(value.clone());
+        }
+    }
+    create(rects)
 }
 
 impl Clone for PlaneDamageClips {
@@ -611,4 +649,74 @@ fn ensure_legacy_planes<'a>(
     }
 
     Ok(config.fb)
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn rect(x2: i32) -> drm_ffi::drm_mode_rect {
+        drm_ffi::drm_mode_rect {
+            x1: 0,
+            y1: 0,
+            x2,
+            y2: 20,
+        }
+    }
+
+    #[test]
+    fn equal_damage_reuses_blob_without_creating_another() {
+        let old_rects = [rect(10)];
+        let blob = Arc::new(17);
+        let reused = reuse_or_create_damage(vec![rect(10)], Some((&old_rects, &blob)), |_| {
+            panic!("identical damage must not create a property blob")
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&blob, &reused));
+    }
+
+    #[test]
+    fn changed_rectangle_or_count_creates_a_new_blob() {
+        let old_rects = [rect(10)];
+        let blob = Arc::new(17);
+        let creates = Cell::new(0);
+        for rects in [vec![rect(11)], vec![rect(10), rect(10)]] {
+            let new = reuse_or_create_damage(rects, Some((&old_rects, &blob)), |_| {
+                creates.set(creates.get() + 1);
+                Ok(Arc::new(18))
+            })
+            .unwrap();
+            assert!(!Arc::ptr_eq(&blob, &new));
+        }
+        assert_eq!(creates.get(), 2);
+    }
+
+    #[test]
+    fn new_blob_failure_preserves_previous_blob() {
+        let old_rects = [rect(10)];
+        let blob = Arc::new(17);
+        let result = reuse_or_create_damage(vec![rect(11)], Some((&old_rects, &blob)), |_| {
+            Err(io::Error::other("creation failed"))
+        });
+        assert!(result.is_err());
+        assert_eq!(Arc::strong_count(&blob), 1);
+        let reused = reuse_or_create_damage(vec![rect(10)], Some((&old_rects, &blob)), |_| {
+            panic!("failed replacement must leave the old entry usable")
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&blob, &reused));
+    }
+
+    #[test]
+    fn missing_previous_device_entry_always_creates() {
+        let creates = Cell::new(0);
+        let created = reuse_or_create_damage(vec![rect(10)], None, |_| {
+            creates.set(creates.get() + 1);
+            Ok(17)
+        })
+        .unwrap();
+        assert_eq!(created, 17);
+        assert_eq!(creates.get(), 1);
+    }
 }

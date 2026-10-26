@@ -641,7 +641,7 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                         ElementState::Pressed => {
                             let size = window.surface_size();
                             let x = position.x / size.width as f64;
-                            let y = position.y / size.width as f64;
+                            let y = position.y / size.height as f64;
                             let event = InputEvent::TouchDown {
                                 event: WinitTouchStartedEvent {
                                     time: self.timestamp(),
@@ -656,7 +656,7 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                         ElementState::Released => {
                             let size = window.surface_size();
                             let x = position.x / size.width as f64;
-                            let y = position.y / size.width as f64;
+                            let y = position.y / size.height as f64;
                             let event = InputEvent::TouchMotion {
                                 event: WinitTouchMovedEvent {
                                     time: self.timestamp(),

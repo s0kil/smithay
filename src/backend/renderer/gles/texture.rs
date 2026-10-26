@@ -28,6 +28,7 @@ impl GlesTexture {
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
+            cache_identity: Arc::new(()),
             texture: tex,
             sync: RwLock::default(),
             format: internal_format,
@@ -122,6 +123,7 @@ impl TextureSync {
 
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
+    pub(super) cache_identity: Arc<()>,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,
@@ -189,6 +191,8 @@ pub struct GlesMapping {
     pub(super) layout: ffi::types::GLenum,
     pub(super) has_alpha: bool,
     pub(super) size: Size<i32, BufferCoord>,
+    /// Exact packed allocation length, shared by allocation and mapping.
+    pub(super) len: usize,
     pub(super) mapping: AtomicPtr<std::ffi::c_void>,
     pub(super) destruction_callback_sender: Sender<CleanupResource>,
 }

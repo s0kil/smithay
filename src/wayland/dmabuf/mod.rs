@@ -1093,6 +1093,7 @@ impl DmabufParamsData {
                 zwp_linux_buffer_params_v1::Error::InvalidDimensions,
                 "invalid width",
             );
+            return None;
         }
 
         if height < 1 {
@@ -1100,6 +1101,7 @@ impl DmabufParamsData {
                 zwp_linux_buffer_params_v1::Error::InvalidDimensions,
                 "invalid height",
             );
+            return None;
         }
 
         // 3. Validate all the planes
@@ -1200,6 +1202,146 @@ impl DmabufParamsData {
         };
 
         Some(dmabuf)
+    }
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use std::{
+        os::{fd::AsFd, unix::net::UnixStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use wayland_client::{
+        Connection, Dispatch, QueueHandle, delegate_noop,
+        globals::{GlobalListContents, registry_queue_init},
+        protocol::{wl_buffer, wl_registry},
+    };
+    use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+    use wayland_server::Display;
+
+    use super::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+    use crate::{
+        backend::allocator::{Format, Fourcc, Modifier, dmabuf::Dmabuf},
+        wayland::buffer::BufferHandler,
+    };
+
+    struct Server {
+        dmabuf: DmabufState,
+        imports: Arc<AtomicUsize>,
+    }
+    crate::delegate_dispatch2!(Server);
+
+    impl BufferHandler for Server {
+        fn buffer_destroyed(&mut self, _: &wayland_server::protocol::wl_buffer::WlBuffer) {}
+    }
+
+    impl DmabufHandler for Server {
+        fn dmabuf_state(&mut self) -> &mut DmabufState {
+            &mut self.dmabuf
+        }
+
+        fn dmabuf_imported(&mut self, _: &DmabufGlobal, _: Dmabuf, notifier: ImportNotifier) {
+            self.imports.fetch_add(1, Ordering::SeqCst);
+            notifier.failed();
+        }
+    }
+
+    struct Client;
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Client {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    delegate_noop!(Client: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+    delegate_noop!(Client: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
+    delegate_noop!(Client: ignore wl_buffer::WlBuffer);
+
+    fn invalid_dimensions_do_not_reach_import(width: i32, height: i32) {
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let imports = Arc::new(AtomicUsize::new(0));
+        let server_imports = imports.clone();
+        let server = thread::spawn(move || {
+            let mut display = Display::<Server>::new().unwrap();
+            let mut handle = display.handle();
+            let mut dmabuf = DmabufState::new();
+            dmabuf.create_global::<Server>(
+                &handle,
+                [Format {
+                    code: Fourcc::Argb8888,
+                    modifier: Modifier::Linear,
+                }],
+            );
+            let mut state = Server {
+                dmabuf,
+                imports: server_imports,
+            };
+            handle.insert_client(server_socket, Arc::new(())).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !server_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                display.dispatch_clients(&mut state).unwrap();
+                display.flush_clients().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut queue) = registry_queue_init::<Client>(&connection).unwrap();
+        let qh = queue.handle();
+        let dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ()).unwrap();
+        let params = dmabuf.create_params(&qh, ());
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        params.add(file.as_fd(), 0, 0, 16, 0, 0);
+        let _buffer = params.create_immed(
+            width,
+            height,
+            Fourcc::Argb8888 as u32,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            &qh,
+            (),
+        );
+        let result = queue.roundtrip(&mut Client);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            connection
+                .protocol_error()
+                .expect("expected a protocol error")
+                .code,
+            zwp_linux_buffer_params_v1::Error::InvalidDimensions as u32,
+        );
+        assert_eq!(
+            imports.load(Ordering::SeqCst),
+            0,
+            "invalid buffers must not reach import"
+        );
+    }
+
+    #[test]
+    fn zero_dimensions_stop_before_dmabuf_construction() {
+        invalid_dimensions_do_not_reach_import(0, 4);
+        invalid_dimensions_do_not_reach_import(4, 0);
+    }
+
+    #[test]
+    fn negative_dimensions_stop_before_unsigned_plane_size_checks() {
+        invalid_dimensions_do_not_reach_import(-1, 4);
+        invalid_dimensions_do_not_reach_import(4, -1);
     }
 }
 

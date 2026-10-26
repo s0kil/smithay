@@ -1289,19 +1289,20 @@ impl AnvilState<UdevData> {
         }
         surface.last_presentation_time = Some(clock);
 
-        let submit_result = surface
-            .drm_output
-            .frame_submitted()
-            .map_err(Into::<SwapBuffersError>::into);
+        let submit_result = if let Some(completed) = surface.drm_output.frame_submitted_with_result() {
+            // The previous frame was presented even if submitting its successor fails.
+            if let Some(mut feedback) = completed.user_data {
+                feedback.presented(clock, Refresh::fixed(frame_duration), seq as u64, flags);
+            }
+            completed
+                .next_frame_result
+                .map_err(Into::<SwapBuffersError>::into)
+        } else {
+            Ok(())
+        };
 
         let schedule_render = match submit_result {
-            Ok(user_data) => {
-                if let Some(mut feedback) = user_data.flatten() {
-                    feedback.presented(clock, Refresh::fixed(frame_duration), seq as u64, flags);
-                }
-
-                true
-            }
+            Ok(()) => true,
             Err(err) => {
                 warn!("Error during rendering: {:?}", err);
                 match err {

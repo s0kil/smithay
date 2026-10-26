@@ -118,9 +118,10 @@
 //!
 //!     // ...wait for VBlank event
 //!
-//!     compositor
-//!         .frame_submitted()
-//!         .expect("failed to mark frame as submitted");
+//!     if let Some(completed) = compositor.frame_submitted_with_result() {
+//!         // Process completed.user_data before handling the next submission's error.
+//!         completed.next_frame_result.expect("failed to submit the next frame");
+//!     }
 //! } else {
 //!     // ...re-schedule frame
 //! }
@@ -184,9 +185,11 @@ use super::{
 };
 
 mod asynchronous;
+mod completion;
 mod elements;
 mod frame_result;
 mod repaint;
+mod sync;
 
 use elements::*;
 pub use frame_result::*;
@@ -700,11 +703,9 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         let backup = current_config.clone();
         *current_config = state;
 
-        let res = surface.test_state_with_mode(
-            self.build_planes(surface, supports_fencing, true),
-            allow_modeset,
-            false,
-        );
+        let res = self
+            .build_planes(surface, supports_fencing, true, false)
+            .and_then(|planes| surface.test_state_with_mode(planes, allow_modeset, false));
 
         if res.is_err() {
             // test failed, restore previous state
@@ -738,11 +739,9 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
             return Ok(());
         }
 
-        let res = surface.test_state_with_mode(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
-            allow_modeset,
-            false,
-        );
+        let res = self
+            .build_planes(surface, supports_fencing, allow_partial_update, false)
+            .and_then(|planes| surface.test_state_with_mode(planes, allow_modeset, false));
 
         if res.is_ok() {
             self.planes
@@ -763,7 +762,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.commit(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
+            self.build_planes(surface, supports_fencing, allow_partial_update, true)?,
             event,
         )
     }
@@ -778,7 +777,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip_with_flags(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
+            self.build_planes(surface, supports_fencing, allow_partial_update, true)?,
             flip_flags,
         )
     }
@@ -789,21 +788,27 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &'a DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
-    ) -> impl IntoIterator<Item = super::PlaneState<'a>> {
+        wait_for_sync: bool,
+    ) -> Result<impl IntoIterator<Item = super::PlaneState<'a>>, DrmError> {
         for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
             if let Some(config) = state.config.as_mut() {
-                // Try to extract a native fence out of the supplied sync point if any
-                // If the sync point has no native fence or the surface does not support
-                // fencing force a wait
                 if let Some((sync, fence)) = config.sync.as_mut() {
-                    if supports_fencing && fence.is_none() {
-                        *fence = sync.export().map(Arc::new);
-                    }
+                    // TEST_ONLY does not consume the pixels. Actual submission must
+                    // either carry the dependency or wait, even if an advertised
+                    // exportable fence failed to export this time.
+                    sync::prepare(sync, fence, supports_fencing, wait_for_sync).map_err(|err| {
+                        DrmError::Access(AccessError {
+                            errmsg: "Interrupted while waiting for plane rendering",
+                            dev: surface.dev_path(),
+                            source: std::io::Error::new(ErrorKind::Interrupted, err),
+                        })
+                    })?;
                 }
             }
         }
 
-        self.planes
+        Ok(self
+            .planes
             .iter_mut()
             .filter(move |(handle, state)| {
                 // If we are not allowed to do an partial update we want to update all
@@ -845,14 +850,14 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                         .as_ref()
                         .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd())),
                 }),
-            })
+            }))
     }
 }
 
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
-type FrameErrorType<A, F> = FrameError<
+pub(crate) type FrameErrorType<A, F> = FrameError<
     <A as Allocator>::Error,
     <<A as Allocator>::Buffer as AsDmabuf>::Error,
     <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Error,
@@ -1076,6 +1081,20 @@ pub struct FrameRef<'a, U> {
 
     /// Presentation mode of this frame
     pub presentation_mode: PresentationMode,
+}
+
+/// A completed frame and the independent result of submitting its successor.
+#[derive(Debug)]
+pub struct FrameSubmitted<U, E> {
+    /// User data belonging to the completed frame.
+    pub user_data: U,
+    /// Presentation mode actually accepted for the completed frame.
+    pub presentation_mode: PresentationMode,
+    /// Result of submitting the latest queued frame, or `Ok(())` if none was queued.
+    ///
+    /// On failure that queued frame has been consumed, no frame is pending, and
+    /// the completed frame remains current. Its completion data is still valid.
+    pub next_frame_result: Result<(), E>,
 }
 
 /// Composite an output using a combination of planes and rendering
@@ -2436,9 +2455,6 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let mut framebuffer = renderer
-                .bind(&mut dmabuf)
-                .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             // An unchanged scene can keep using the current primary buffer. Repairing an
             // aged back buffer would otherwise cause an unnecessary render and page flip.
             // Resets, pending modesets and transitions from direct scanout still need a
@@ -2453,16 +2469,24 @@ where
                 .primary_buffer_state
                 .can_reuse(previous_composited_buffer, allow_partial_update);
             let render_res = if can_reuse_primary {
-                self.damage_tracker.render_output_if_changed(
+                self.damage_tracker.render_output_if_changed_with_bind(
                     renderer,
-                    &mut framebuffer,
+                    |renderer| renderer.bind(&mut dmabuf),
                     age,
                     &elements,
                     clear_color,
                 )
             } else {
-                self.damage_tracker
-                    .render_output(renderer, &mut framebuffer, age, &elements, clear_color)
+                match renderer.bind(&mut dmabuf) {
+                    Ok(mut framebuffer) => self.damage_tracker.render_output(
+                        renderer,
+                        &mut framebuffer,
+                        age,
+                        &elements,
+                        clear_color,
+                    ),
+                    Err(err) => Err(OutputDamageTrackerError::Rendering(err)),
+                }
             };
 
             // restore the renderer debug flags
@@ -2527,13 +2551,17 @@ where
                             // Here we need to apply the output_transform to the damage since we
                             // haven't rotated our framebuffer. dst is already in the same
                             // coordinate space src is, so no transform needed.
-                            config.damage_clips = PlaneDamageClips::from_damage(
+                            config.damage_clips = PlaneDamageClips::from_damage_with_previous(
                                 self.surface.device_fd(),
                                 config.properties.src,
                                 config.properties.dst,
                                 Transform::Normal,
                                 output_transform,
                                 render_damage.iter().copied(),
+                                previous_state
+                                    .plane_state(self.surface.plane())
+                                    .and_then(|state| state.config.as_ref())
+                                    .and_then(|config| config.damage_clips.as_ref()),
                             )
                             .ok()
                             .flatten();
@@ -2935,21 +2963,44 @@ where
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)
     /// was received after calling [`DrmCompositor::queue_frame`] on this surface.
     /// Otherwise the underlying swapchain will run out of buffers eventually.
+    ///
+    /// This compatibility method returns an error if submitting the next queued
+    /// frame fails, so it cannot also return the completed frame's user data in
+    /// that case. Use [`Self::frame_submitted_with_result`] to handle both outcomes.
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        let Some(PendingFrame {
-            mut frame, user_data, ..
-        }) = self.pending_frame.take()
-        else {
-            return Ok(None);
-        };
+        self.frame_submitted_with_result()
+            .map(|completed| completed.next_frame_result.map(|()| completed.user_data))
+            .transpose()
+    }
 
-        std::mem::swap(&mut frame, &mut self.current_frame);
-        if self.queued_frame.is_some() {
-            self.submit()?;
-        }
-
-        Ok(Some(user_data))
+    /// Complete the pending frame without losing its data if the next submission fails.
+    ///
+    /// Call this on the matching DRM page-flip completion event, just like
+    /// [`Self::frame_submitted`]. The completed frame is promoted before attempting
+    /// to submit the latest queued frame. Both outcomes are returned separately.
+    /// Prefer this method when presentation feedback must survive a successor's
+    /// submission error. The accepted presentation mode belongs to the completed
+    /// frame, not its successor.
+    #[profiling::function]
+    pub fn frame_submitted_with_result(&mut self) -> Option<FrameSubmitted<U, FrameErrorType<A, F>>> {
+        completion::complete_frame(
+            self,
+            |compositor| {
+                compositor
+                    .pending_frame
+                    .take()
+                    .map(|pending| (pending.frame, pending.user_data, pending.presentation_mode))
+            },
+            |compositor, frame| std::mem::replace(&mut compositor.current_frame, frame),
+            |compositor| {
+                if compositor.queued_frame.is_some() {
+                    compositor.submit()
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     /// Reset the underlying buffers
@@ -4371,13 +4422,17 @@ where
         // scale computation as it's already in physical space.
         let transform = element.transform().invert();
         let damage_clips = if has_element_damage {
-            PlaneDamageClips::from_damage(
+            PlaneDamageClips::from_damage_with_previous(
                 self.surface.device_fd(),
                 element_config.properties.src,
                 element_config.geometry,
                 transform,
                 transform,
                 element_damage,
+                previous_state
+                    .plane_state(plane.handle)
+                    .and_then(|state| state.config.as_ref())
+                    .and_then(|config| config.damage_clips.as_ref()),
             )
             .ok()
             .flatten()
