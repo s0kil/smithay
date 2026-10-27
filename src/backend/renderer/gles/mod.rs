@@ -26,6 +26,8 @@ pub mod element;
 mod error;
 pub mod format;
 mod framebuffer;
+pub(crate) mod gpu_timing;
+mod gpu_timing_fence;
 pub mod profiler;
 mod shaders;
 mod texture;
@@ -400,6 +402,7 @@ pub struct GlesRenderer {
 
     // profiling
     profiler: profiler::GpuProfiler,
+    gpu_timing: Option<gpu_timing::GpuTiming>,
 }
 
 /// Handle to the currently rendered frame during [`GlesRenderer::render`](Renderer::render).
@@ -421,6 +424,7 @@ pub struct GlesFrame<'frame, 'buffer> {
     span: EnteredSpan,
 
     gpu_span: Option<profiler::GpuSpan>,
+    gpu_timing_frame: u64,
 }
 
 impl fmt::Debug for GlesFrame<'_, '_> {
@@ -707,6 +711,7 @@ impl GlesRenderer {
         drop(_guard);
 
         let profiler = profiler::GpuProfiler::new(&gl, &exts);
+        let gpu_timing = gpu_timing::GpuTiming::new(&gl, &exts);
 
         let renderer = GlesRenderer {
             gl,
@@ -740,6 +745,7 @@ impl GlesRenderer {
             gl_debug_span,
 
             profiler,
+            gpu_timing,
         };
         renderer.egl.unbind()?;
         Ok(renderer)
@@ -860,6 +866,13 @@ impl GlesRenderer {
             });
         }
         self.gles_cleanup().cleanup(&self.egl, &self.gl)?;
+        if let Some(timing) = &self.gpu_timing {
+            // Cache cleanup may be called while another renderer's context is
+            // current. Diagnostics must never change that context selection.
+            if timing.has_pending() && self.egl.is_current() {
+                timing.collect(&self.gl);
+            }
+        }
         Ok(())
     }
 
@@ -963,6 +976,7 @@ impl ImportMemWl for GlesRenderer {
                         upload_full = true;
                         let new = Arc::new(GlesTextureInternal {
                             cache_identity: Arc::new(()),
+                            timing: None,
                             texture: tex,
                             sync: RwLock::default(),
                             format: Some(internal_format),
@@ -1134,6 +1148,7 @@ impl ImportMem for GlesRenderer {
             // new texture, upload in full
             GlesTextureInternal {
                 cache_identity: Arc::new(()),
+                timing: None,
                 texture: tex,
                 sync,
                 format: Some(internal),
@@ -1276,6 +1291,7 @@ impl ImportEgl for GlesRenderer {
 
         let texture = GlesTexture(Arc::new(GlesTextureInternal {
             cache_identity: Arc::new(()),
+            timing: None,
             texture: tex,
             sync: RwLock::default(),
             format: match egl.format {
@@ -1316,7 +1332,11 @@ impl ImportDma for GlesRenderer {
                 .create_image_from_dmabuf(buffer)
                 .map_err(GlesError::BindBufferEGLError)?;
 
-            let tex = match self.import_egl_image(image, is_external, None) {
+            let timing = self
+                .gpu_timing
+                .as_ref()
+                .map(|_| gpu_timing::DmabufTiming::new(buffer));
+            let tex = match self.import_egl_image_timed(image, is_external, None, timing.as_ref()) {
                 Ok(tex) => tex,
                 Err(err) => {
                     unsafe {
@@ -1331,6 +1351,7 @@ impl ImportDma for GlesRenderer {
             let has_alpha = has_alpha(buffer.format().code);
             let texture = GlesTexture(Arc::new(GlesTextureInternal {
                 cache_identity: Arc::new(()),
+                timing,
                 texture: tex,
                 sync: RwLock::default(),
                 format: Some(format),
@@ -1371,7 +1392,12 @@ impl GlesRenderer {
                 return Ok(None);
             }
             let tex = Some(texture.0.texture);
-            self.import_egl_image(egl_images[0], texture.0.is_external, tex)?;
+            self.import_egl_image_timed(
+                egl_images[0],
+                texture.0.is_external,
+                tex,
+                texture.0.timing.as_ref(),
+            )?;
         }
         Ok(Some(texture.clone()))
     }
@@ -1383,9 +1409,24 @@ impl GlesRenderer {
         is_external: bool,
         tex: Option<u32>,
     ) -> Result<u32, GlesError> {
+        self.import_egl_image_timed(image, is_external, tex, None)
+    }
+
+    fn import_egl_image_timed(
+        &self,
+        image: EGLImage,
+        is_external: bool,
+        tex: Option<u32>,
+        source: Option<&Arc<gpu_timing::DmabufTiming>>,
+    ) -> Result<u32, GlesError> {
         unsafe {
             self.egl.make_current()?;
         }
+        let timing = self
+            .gpu_timing
+            .as_ref()
+            .zip(source)
+            .and_then(|(timing, source)| timing.begin(&self.gl, "dmabuf_bind", source, 0));
         let tex = tex.unwrap_or_else(|| unsafe {
             let mut tex = 0;
             self.gl.GenTextures(1, &mut tex);
@@ -1402,6 +1443,9 @@ impl GlesRenderer {
             self.gl.BindTexture(target, 0);
         }
 
+        if let Some(timing) = timing {
+            timing.complete();
+        }
         Ok(tex)
     }
 }
@@ -1912,6 +1956,9 @@ impl Blit for GlesRenderer {
         }
 
         self.profiler.collect(&self.gl);
+        if let Some(timing) = &self.gpu_timing {
+            timing.collect(&self.gl);
+        }
         let scope = self.profiler.scope(gpu_span_location!("blit"), &self.gl);
 
         match &src_target.0 {
@@ -2000,6 +2047,9 @@ impl Drop for GlesRenderer {
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
 
                 self.profiler.cleanup(Some(&self.gl));
+                if let Some(timing) = &self.gpu_timing {
+                    timing.cleanup(Some(&self.gl));
+                }
 
                 if self.extensions.iter().any(|ext| ext == "GL_KHR_debug") {
                     self.gl.Disable(ffi::DEBUG_OUTPUT);
@@ -2011,6 +2061,9 @@ impl Drop for GlesRenderer {
                 let _ = self.egl.unbind();
             } else {
                 self.profiler.cleanup(None);
+                if let Some(timing) = &self.gpu_timing {
+                    timing.cleanup(None);
+                }
             }
 
             if let Some(gl_debug_ptr) = self.gl_debug_span.take() {
@@ -2069,6 +2122,9 @@ impl GlesRenderer {
         self.renderbuffer_framebuffers.clear();
 
         self.profiler.collect(&self.gl);
+        if let Some(timing) = &self.gpu_timing {
+            timing.collect(&self.gl);
+        }
 
         let result = {
             let _scope = self.profiler.scope(location, &self.gl);
@@ -2342,7 +2398,15 @@ impl Renderer for GlesRenderer {
         target.0.make_current(&self.gl, &self.egl)?;
 
         // Collect last frame's timestamps.
+        let gpu_timing_frame = self
+            .gpu_timing
+            .as_ref()
+            .map(|timing| timing.begin_frame())
+            .unwrap_or(0);
         self.profiler.collect(&self.gl);
+        if let Some(timing) = &self.gpu_timing {
+            timing.collect(&self.gl);
+        }
 
         let gpu_span = self.profiler.enter(gpu_span_location!("render"), &self.gl);
 
@@ -2397,6 +2461,7 @@ impl Renderer for GlesRenderer {
             span,
 
             gpu_span: Some(gpu_span),
+            gpu_timing_frame,
         })
     }
 
@@ -2659,6 +2724,9 @@ impl GlesFrame<'_, '_> {
         if let Some(sync_point) = self.renderer.export_sync_point() {
             // Sync after glFlush in export_sync_point() and right before returning.
             self.renderer.profiler.sync_gpu(&self.renderer.gl);
+            if let Some(timing) = &self.renderer.gpu_timing {
+                timing.frame_finished(self.gpu_timing_frame, &sync_point);
+            }
             return Ok(sync_point);
         }
 
@@ -2668,7 +2736,11 @@ impl GlesFrame<'_, '_> {
         unsafe {
             self.renderer.gl.Finish();
         }
-        Ok(SyncPoint::signaled())
+        let sync_point = SyncPoint::signaled();
+        if let Some(timing) = &self.renderer.gpu_timing {
+            timing.frame_finished(self.gpu_timing_frame, &sync_point);
+        }
+        Ok(sync_point)
     }
 
     /// Overrides the default texture shader used, if none is specified.
@@ -3048,8 +3120,17 @@ impl GlesFrame<'_, '_> {
         // render
         let gl = &self.renderer.gl;
         let sync_lock = tex.0.sync.read().unwrap();
+        let mut timing = self
+            .renderer
+            .gpu_timing
+            .as_ref()
+            .zip(tex.0.timing.as_ref())
+            .and_then(|(timing, source)| timing.begin(gl, "dmabuf_draw", source, self.gpu_timing_frame));
         unsafe {
             sync_lock.wait_for_upload(gl);
+            if let Some(timing) = &mut timing {
+                timing.wait_done();
+            }
             let scope = self
                 .renderer
                 .profiler
@@ -3125,6 +3206,9 @@ impl GlesFrame<'_, '_> {
                 self.renderer.vertices.as_ptr() as *const _,
             );
 
+            if let Some(timing) = &mut timing {
+                timing.draw_begin();
+            }
             if self.renderer.capabilities.contains(&Capability::Instancing) {
                 let _scope = self
                     .renderer
@@ -3160,6 +3244,9 @@ impl GlesFrame<'_, '_> {
                 gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
             }
 
+            if let Some(timing) = timing.take() {
+                timing.complete();
+            }
             gl.BindTexture(target, 0);
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
             gl.DisableVertexAttribArray(program.attrib_vert_position as u32);

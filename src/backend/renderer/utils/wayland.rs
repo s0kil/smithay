@@ -142,7 +142,7 @@ impl PartialEq<WlBuffer> for &Buffer {
 
 impl RendererSurfaceState {
     #[profiling::function]
-    pub(crate) fn update_buffer(&mut self, states: &SurfaceData) {
+    pub(crate) fn update_buffer(&mut self, _surface: &WlSurface, states: &SurfaceData) {
         #[cfg(feature = "backend_drm")]
         let mut guard = states.cached_state.get::<DrmSyncobjCachedState>();
         #[cfg(feature = "backend_drm")]
@@ -158,12 +158,29 @@ impl RendererSurfaceState {
                 if self.buffer_dimensions.is_none() {
                     // This results in us rendering nothing (can happen e.g. for failed egl-buffer-calls),
                     // but it is better than crashing the compositor for a bad buffer
+                    #[cfg(all(feature = "renderer_gl", feature = "backend_drm"))]
+                    crate::backend::renderer::gles::gpu_timing::register_explicit_acquire(
+                        wayland_server::Resource::id(_surface),
+                        None,
+                        None,
+                    );
                     self.reset();
                     return;
                 }
                 self.buffer_has_alpha = buffer_has_alpha(&buffer);
                 self.buffer_scale = attrs.buffer_scale;
                 self.buffer_transform = attrs.buffer_transform.into();
+
+                // Observe the acquire point of this committed buffer before it
+                // is moved into InnerBuffer. Diagnostic registration never
+                // waits or changes synchronization, and None clears an older
+                // explicit association when a DMA-BUF is reused implicitly.
+                #[cfg(all(feature = "renderer_gl", feature = "backend_drm"))]
+                crate::backend::renderer::gles::gpu_timing::register_explicit_acquire(
+                    wayland_server::Resource::id(_surface),
+                    crate::wayland::dmabuf::get_dmabuf(&buffer).ok(),
+                    syncobj_state.acquire_point.as_ref(),
+                );
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
                     self.buffer = Some(Buffer {
@@ -180,6 +197,12 @@ impl RendererSurfaceState {
                 self.textures.clear();
             }
             Some(BufferAssignment::Removed) => {
+                #[cfg(all(feature = "renderer_gl", feature = "backend_drm"))]
+                crate::backend::renderer::gles::gpu_timing::register_explicit_acquire(
+                    wayland_server::Resource::id(_surface),
+                    None,
+                    None,
+                );
                 self.reset();
                 return;
             }
@@ -386,7 +409,7 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     .unwrap()
                     .lock()
                     .unwrap();
-                data.update_buffer(states);
+                data.update_buffer(surf, states);
             },
             |_, _, _| true,
         );
@@ -396,6 +419,12 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                 // to prevent a deadlock which can happen if we try to send a buffer
                 // release during drop. This also enables us to free resources earlier
                 // like the stored textures
+                #[cfg(all(feature = "renderer_gl", feature = "backend_drm"))]
+                crate::backend::renderer::gles::gpu_timing::register_explicit_acquire(
+                    wayland_server::Resource::id(surface),
+                    None,
+                    None,
+                );
                 compositor::with_states(surface, |data| {
                     if let Some(mut state) = data
                         .data_map

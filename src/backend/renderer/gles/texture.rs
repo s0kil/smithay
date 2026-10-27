@@ -29,6 +29,7 @@ impl GlesTexture {
     ) -> GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
             cache_identity: Arc::new(()),
+            timing: None,
             texture: tex,
             sync: RwLock::default(),
             format: internal_format,
@@ -124,6 +125,7 @@ impl TextureSync {
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
     pub(super) cache_identity: Arc<()>,
+    pub(super) timing: Option<Arc<gpu_timing::DmabufTiming>>,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,
